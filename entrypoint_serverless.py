@@ -45,8 +45,11 @@ def parse_credential_provider_from_args():
     """
     Parse the credential provider from command-line arguments.
     
-    Looks for --flyte-credential-provider=<name> in sys.argv
+    Looks for --flyte-credential-provider=<name> anywhere in sys.argv
     and removes it from the args list.
+    
+    The argument can be at any position (typically at the end to avoid
+    breaking pyflyte-fast-execute which must be the first argument).
     
     Returns:
         tuple: (credential_provider, remaining_args)
@@ -57,8 +60,12 @@ def parse_credential_provider_from_args():
     for arg in sys.argv[1:]:
         if arg.startswith("--flyte-credential-provider="):
             credential_provider = arg.split("=", 1)[1]
+            print(f"[Flyte Serverless] Found credential provider in args: {credential_provider}")
         else:
             remaining_args.append(arg)
+    
+    if remaining_args:
+        print(f"[Flyte Serverless] Command after parsing: {remaining_args[0]} ...")
     
     return credential_provider, remaining_args
 
