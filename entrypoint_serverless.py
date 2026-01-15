@@ -12,35 +12,14 @@ Key differences from the classic entrypoint:
 - Compatible with Spark Connect APIs
 - Configures AWS credentials from Databricks service credentials
 
-Required Environment Variables:
-    DATABRICKS_SERVICE_CREDENTIAL_PROVIDER: Name of the Databricks service credential
-        provider to use for AWS access (e.g., 'egdataplatform-test-flyte-workflow-access-us-east-1')
+Credential Provider Configuration (in order of precedence):
+    1. Command-line argument: --flyte-credential-provider=<name>
+    2. Environment variable: DATABRICKS_SERVICE_CREDENTIAL_PROVIDER
+    3. Hardcoded fallback (if configured below)
 
 Optional Environment Variables:
     AWS_DEFAULT_REGION: AWS region (defaults to 'us-east-1')
     FLYTE_INTERNAL_WORK_DIR: Working directory (defaults to '/tmp/flyte')
-
-Usage in your Flyte task config:
-    DatabricksV2(
-        databricks_conf={
-            "environment_key": "default",
-            "environments": [{
-                "environment_key": "default",
-                "spec": {
-                    "client": "1",
-                    "environment_vars": {
-                        "DATABRICKS_SERVICE_CREDENTIAL_PROVIDER": "your-credential-provider-name"
-                    }
-                }
-            }],
-            "git_source": {
-                "git_url": "https://github.com/YOUR_ORG/YOUR_REPO",
-                "git_provider": "gitHub",
-                "git_branch": "main",
-            },
-            "python_file": "path/to/entrypoint_serverless.py",
-        }
-    )
 """
 
 import os
@@ -50,7 +29,102 @@ import tempfile
 from pathlib import Path
 
 
-def setup_aws_credentials_from_databricks():
+# =============================================================================
+# CONFIGURATION: Set your default credential provider here
+# =============================================================================
+# If environment variables don't work in your Databricks serverless setup,
+# you can hardcode the credential provider name here as a fallback.
+# Set to None to disable the fallback.
+
+DEFAULT_CREDENTIAL_PROVIDER = "egdataplatform-test-flyte-workflow-access-us-east-1"
+
+# =============================================================================
+
+
+def parse_credential_provider_from_args():
+    """
+    Parse the credential provider from command-line arguments.
+    
+    Looks for --flyte-credential-provider=<name> in sys.argv
+    and removes it from the args list.
+    
+    Returns:
+        tuple: (credential_provider, remaining_args)
+    """
+    credential_provider = None
+    remaining_args = []
+    
+    for arg in sys.argv[1:]:
+        if arg.startswith("--flyte-credential-provider="):
+            credential_provider = arg.split("=", 1)[1]
+        else:
+            remaining_args.append(arg)
+    
+    return credential_provider, remaining_args
+
+
+def debug_print_environment():
+    """Print all environment variables for debugging."""
+    print("[Flyte Serverless] === DEBUG: All Environment Variables ===")
+    relevant_vars = []
+    other_vars = []
+    
+    for key in sorted(os.environ.keys()):
+        value = os.environ[key]
+        # Mask sensitive values
+        if any(secret_word in key.upper() for secret_word in ['SECRET', 'TOKEN', 'PASSWORD', 'KEY', 'CREDENTIAL']):
+            if len(value) > 8:
+                value = value[:4] + "****" + value[-4:]
+        
+        # Categorize
+        if any(x in key.upper() for x in ['AWS', 'FLYTE', 'DATABRICKS', 'S3', 'SPARK']):
+            relevant_vars.append(f"  {key}={value}")
+        else:
+            other_vars.append(f"  {key}={value}")
+    
+    print("[Flyte Serverless] Relevant variables:")
+    for v in relevant_vars:
+        print(f"[Flyte Serverless] {v}")
+    
+    print(f"[Flyte Serverless] + {len(other_vars)} other variables")
+    print("[Flyte Serverless] === END Environment Variables ===")
+
+
+def try_get_credential_provider_from_spark_conf():
+    """
+    Try to get the credential provider name from Spark configuration.
+    
+    Databricks serverless might pass environment_vars through Spark conf
+    instead of OS environment variables.
+    """
+    try:
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+        
+        # Try to get all Spark conf and look for our variable
+        print("[Flyte Serverless] Checking Spark configuration...")
+        
+        all_conf = spark.sparkContext.getConf().getAll()
+        for key, value in all_conf:
+            if 'credential' in key.lower() or 'DATABRICKS' in key.upper():
+                print(f"[Flyte Serverless] Spark conf: {key}={value}")
+        
+        # Try common Spark conf locations
+        try:
+            provider = spark.conf.get("spark.databricks.service.credential.provider")
+            if provider:
+                print(f"[Flyte Serverless] Found credential provider in Spark conf: {provider}")
+                return provider
+        except Exception:
+            pass
+            
+    except Exception as e:
+        print(f"[Flyte Serverless] Could not inspect Spark conf: {e}")
+    
+    return None
+
+
+def setup_aws_credentials_from_databricks(credential_provider: str = None):
     """
     Configure AWS credentials from Databricks service credentials.
     
@@ -58,23 +132,33 @@ def setup_aws_credentials_from_databricks():
     environment variables) are not available. Instead, credentials must be obtained
     via dbutils.credentials.getServiceCredentialsProvider().
     
-    This function:
-    1. Gets the credential provider name from environment variable
-    2. Uses dbutils to get a botocore session with proper credentials
-    3. Extracts the credentials and sets them as environment variables
-    4. This allows flytekit (via s3fs/boto3) to access S3 seamlessly
+    Args:
+        credential_provider: Optional credential provider name (overrides env var)
     
     Returns:
         bool: True if credentials were configured, False otherwise
     """
-    credential_provider = os.environ.get("DATABRICKS_SERVICE_CREDENTIAL_PROVIDER")
+    # Try to get credential provider from multiple sources (in order of precedence)
+    if not credential_provider:
+        credential_provider = os.environ.get("DATABRICKS_SERVICE_CREDENTIAL_PROVIDER")
     
     if not credential_provider:
-        print("[Flyte Serverless] WARNING: DATABRICKS_SERVICE_CREDENTIAL_PROVIDER not set")
-        print("[Flyte Serverless] S3 access may fail without proper AWS credentials")
-        return False
+        print("[Flyte Serverless] Credential provider not in env vars, trying Spark conf...")
+        credential_provider = try_get_credential_provider_from_spark_conf()
     
-    print(f"[Flyte Serverless] Configuring AWS credentials from Databricks service credential: {credential_provider}")
+    if not credential_provider:
+        if DEFAULT_CREDENTIAL_PROVIDER:
+            print(f"[Flyte Serverless] Using hardcoded fallback credential provider: {DEFAULT_CREDENTIAL_PROVIDER}")
+            credential_provider = DEFAULT_CREDENTIAL_PROVIDER
+        else:
+            print("[Flyte Serverless] WARNING: No credential provider found")
+            print("[Flyte Serverless] Options to fix:")
+            print("[Flyte Serverless]   1. Set DEFAULT_CREDENTIAL_PROVIDER in entrypoint_serverless.py")
+            print("[Flyte Serverless]   2. Pass --flyte-credential-provider=<name> in spark_python_task parameters")
+            print("[Flyte Serverless]   3. Set DATABRICKS_SERVICE_CREDENTIAL_PROVIDER env var")
+            return False
+    
+    print(f"[Flyte Serverless] Configuring AWS credentials from: {credential_provider}")
     
     try:
         # Import dbutils - only available in Databricks runtime
@@ -86,6 +170,7 @@ def setup_aws_credentials_from_databricks():
         dbutils = DBUtils(spark)
         
         # Get the botocore session from Databricks service credentials
+        print("[Flyte Serverless] Calling dbutils.credentials.getServiceCredentialsProvider()...")
         botocore_session = dbutils.credentials.getServiceCredentialsProvider(credential_provider)
         
         # Create a boto3 session with this botocore session
@@ -116,9 +201,9 @@ def setup_aws_credentials_from_databricks():
         try:
             sts_client = session.client("sts")
             identity = sts_client.get_caller_identity()
-            print(f"[Flyte Serverless] AWS credentials configured successfully")
-            print(f"[Flyte Serverless] AWS Account: {identity.get('Account', 'unknown')}")
-            print(f"[Flyte Serverless] AWS ARN: {identity.get('Arn', 'unknown')}")
+            print(f"[Flyte Serverless] ✓ AWS credentials configured successfully")
+            print(f"[Flyte Serverless]   Account: {identity.get('Account', 'unknown')}")
+            print(f"[Flyte Serverless]   ARN: {identity.get('Arn', 'unknown')}")
         except Exception as e:
             print(f"[Flyte Serverless] WARNING: Could not verify AWS credentials: {e}")
         
@@ -154,16 +239,6 @@ def setup_environment():
     return work_dir
 
 
-def download_inputs(work_dir: str):
-    """
-    Download any required inputs or dependencies.
-    This is called before executing the Flyte task.
-    """
-    # The pyflyte-fast-execute command handles downloading the distribution
-    # and setting up the environment, so we don't need to do much here
-    pass
-
-
 def execute_flyte_command(args: list):
     """Execute the Flyte command with the provided arguments."""
     if not args:
@@ -189,29 +264,36 @@ def execute_flyte_command(args: list):
 
 def main():
     """Main entrypoint for Flyte serverless tasks."""
-    print("[Flyte Serverless] Starting serverless entrypoint...")
+    print("[Flyte Serverless] " + "=" * 60)
+    print("[Flyte Serverless] Starting Flyte Serverless Entrypoint")
+    print("[Flyte Serverless] " + "=" * 60)
     print(f"[Flyte Serverless] Python version: {sys.version}")
-    print(f"[Flyte Serverless] Arguments: {sys.argv[1:]}")
+    print(f"[Flyte Serverless] Raw arguments: {sys.argv[1:]}")
+    
+    # Parse credential provider from command-line arguments
+    credential_provider, remaining_args = parse_credential_provider_from_args()
+    if credential_provider:
+        print(f"[Flyte Serverless] Credential provider from args: {credential_provider}")
+    
+    # Debug: Print relevant environment variables
+    debug_print_environment()
     
     # Configure AWS credentials from Databricks service credentials
     # This must happen BEFORE any S3 access attempts
-    credentials_configured = setup_aws_credentials_from_databricks()
+    credentials_configured = setup_aws_credentials_from_databricks(credential_provider)
     if not credentials_configured:
-        print("[Flyte Serverless] WARNING: Running without Databricks-managed AWS credentials")
+        print("[Flyte Serverless] ⚠ WARNING: Running without Databricks-managed AWS credentials")
+        print("[Flyte Serverless] S3 operations will likely fail!")
     
     # Set up the working environment
     work_dir = setup_environment()
     
-    # Download any required inputs
-    download_inputs(work_dir)
+    # Execute the Flyte command with remaining arguments
+    return_code = execute_flyte_command(remaining_args)
     
-    # Get command arguments (skip script name)
-    args = sys.argv[1:]
-    
-    # Execute the Flyte command
-    return_code = execute_flyte_command(args)
-    
+    print("[Flyte Serverless] " + "=" * 60)
     print(f"[Flyte Serverless] Task completed with return code: {return_code}")
+    print("[Flyte Serverless] " + "=" * 60)
     sys.exit(return_code)
 
 
