@@ -260,14 +260,44 @@ def patch_spark_plugin_on_disk():
         # SERVERLESS_PATCHED: Modified for Databricks serverless compatibility
         import os
         if os.environ.get("DATABRICKS_SERVERLESS") == "true" or os.environ.get("SPARK_CONNECT_MODE_ENABLED") == "1":
-            import pyspark as _pyspark
             print("[Flyte Serverless] Using serverless-compatible pre_execute")
+            self.sess = None
+            
+            # Method 1: Try to get the active session (already initialized by Databricks)
             try:
-                self.sess = _pyspark.sql.SparkSession.builder.getOrCreate()
-                print("[Flyte Serverless] ✓ Got SparkSession successfully")
+                from pyspark.sql import SparkSession
+                self.sess = SparkSession.getActiveSession()
+                if self.sess:
+                    print("[Flyte Serverless] ✓ Got active SparkSession")
             except Exception as e:
-                print(f"[Flyte Serverless] Warning: Could not get SparkSession: {e}")
-                self.sess = None
+                print(f"[Flyte Serverless] getActiveSession failed: {e}")
+            
+            # Method 2: Try to get 'spark' from the Databricks runtime globals
+            if not self.sess:
+                try:
+                    import builtins
+                    if hasattr(builtins, 'spark'):
+                        self.sess = builtins.spark
+                        print("[Flyte Serverless] ✓ Got SparkSession from builtins.spark")
+                except Exception as e:
+                    print(f"[Flyte Serverless] builtins.spark failed: {e}")
+            
+            # Method 3: Connect using SPARK_REMOTE env var (Unix socket for serverless)
+            if not self.sess:
+                spark_remote = os.environ.get("SPARK_REMOTE")
+                if spark_remote:
+                    try:
+                        from pyspark.sql import SparkSession
+                        # Use remote() to connect via Spark Connect
+                        self.sess = SparkSession.builder.remote(spark_remote).getOrCreate()
+                        print(f"[Flyte Serverless] ✓ Connected via SPARK_REMOTE: {spark_remote[:50]}...")
+                    except Exception as e:
+                        print(f"[Flyte Serverless] SPARK_REMOTE connection failed: {e}")
+            
+            # Method 4: For tasks that don't need Spark, just continue without it
+            if not self.sess:
+                print("[Flyte Serverless] No SparkSession available - task will run without Spark")
+            
             return user_params.builder().add_attr("SPARK_SESSION", self.sess).build()
         
         # Original pre_execute logic for non-serverless environments follows'''
@@ -334,16 +364,42 @@ def patch_spark_plugin_for_serverless():
         
         def serverless_pre_execute(self, user_params: ExecutionParameters) -> ExecutionParameters:
             """Serverless-compatible pre_execute that handles Spark Connect properly."""
-            import pyspark as _pyspark
+            from pyspark.sql import SparkSession
             
             print("[Flyte Serverless] Using patched pre_execute for Spark Connect compatibility")
+            self.sess = None
             
+            # Try to get the active session (already initialized by Databricks)
             try:
-                self.sess = _pyspark.sql.SparkSession.builder.getOrCreate()
-                print(f"[Flyte Serverless] Got SparkSession successfully")
+                self.sess = SparkSession.getActiveSession()
+                if self.sess:
+                    print("[Flyte Serverless] ✓ Got active SparkSession")
             except Exception as e:
-                print(f"[Flyte Serverless] Warning: Could not get SparkSession: {e}")
-                self.sess = None
+                print(f"[Flyte Serverless] getActiveSession failed: {e}")
+            
+            # Try to get 'spark' from builtins
+            if not self.sess:
+                try:
+                    import builtins
+                    if hasattr(builtins, 'spark'):
+                        self.sess = builtins.spark
+                        print("[Flyte Serverless] ✓ Got SparkSession from builtins.spark")
+                except Exception as e:
+                    print(f"[Flyte Serverless] builtins.spark failed: {e}")
+            
+            # Try SPARK_REMOTE env var
+            if not self.sess:
+                import os
+                spark_remote = os.environ.get("SPARK_REMOTE")
+                if spark_remote:
+                    try:
+                        self.sess = SparkSession.builder.remote(spark_remote).getOrCreate()
+                        print(f"[Flyte Serverless] ✓ Connected via SPARK_REMOTE")
+                    except Exception as e:
+                        print(f"[Flyte Serverless] SPARK_REMOTE connection failed: {e}")
+            
+            if not self.sess:
+                print("[Flyte Serverless] No SparkSession available - task will run without Spark")
             
             return user_params.builder().add_attr("SPARK_SESSION", self.sess).build()
         
