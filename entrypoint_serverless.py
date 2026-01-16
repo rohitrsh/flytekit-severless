@@ -532,6 +532,16 @@ def execute_flyte_command(args: list):
     return execute_flyte_command_inprocess(args)
 
 
+def is_running_in_ipython():
+    """Check if we're running inside IPython/Jupyter/Databricks notebook."""
+    try:
+        # Check for IPython
+        get_ipython()  # noqa: F821
+        return True
+    except NameError:
+        return False
+
+
 def main():
     """Main entrypoint for Flyte serverless tasks."""
     print("[Flyte Serverless] " + "=" * 60)
@@ -564,7 +574,19 @@ def main():
     print("[Flyte Serverless] " + "=" * 60)
     print(f"[Flyte Serverless] Task completed with return code: {return_code}")
     print("[Flyte Serverless] " + "=" * 60)
-    sys.exit(return_code)
+    
+    # In IPython/Databricks notebook context, sys.exit() raises SystemExit which
+    # appears as a traceback and may be interpreted as an error by Databricks.
+    # Instead, just return the code - Databricks will pick it up from the task result.
+    if is_running_in_ipython():
+        print(f"[Flyte Serverless] Running in IPython context, not calling sys.exit()")
+        if return_code != 0:
+            # For non-zero exit, raise an exception that clearly indicates failure
+            raise RuntimeError(f"Flyte task failed with return code: {return_code}")
+        # For success (return_code == 0), just return normally
+        return return_code
+    else:
+        sys.exit(return_code)
 
 
 if __name__ == "__main__":
