@@ -227,19 +227,110 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
         return False
 
 
+def patch_spark_plugin_on_disk():
+    """
+    Patch the installed flytekitplugins-spark plugin file on disk.
+    
+    This is necessary because fast_execute_task_cmd spawns a subprocess,
+    and in-memory patches don't survive across processes. By patching
+    the actual file, subprocesses will import the patched version.
+    """
+    try:
+        import flytekitplugins.spark.task as task_module
+        task_file = task_module.__file__
+        
+        print(f"[Flyte Serverless] Patching spark plugin at: {task_file}")
+        
+        with open(task_file, 'r') as f:
+            content = f.read()
+        
+        # Check if already patched
+        if "SERVERLESS_PATCHED" in content:
+            print("[Flyte Serverless] ✓ Spark plugin already patched on disk")
+            return True
+        
+        # Find the pre_execute method and replace it
+        # The original code has this pattern in the pre_execute method:
+        # sess_builder = ... (building SparkSession with configs)
+        # self.sess = sess_builder.getOrCreate()
+        
+        # We need to inject a check at the beginning of pre_execute
+        patch_code = '''
+    def pre_execute(self, user_params: ExecutionParameters) -> ExecutionParameters:
+        # SERVERLESS_PATCHED: Modified for Databricks serverless compatibility
+        import os
+        if os.environ.get("DATABRICKS_SERVERLESS") == "true" or os.environ.get("SPARK_CONNECT_MODE_ENABLED") == "1":
+            import pyspark as _pyspark
+            print("[Flyte Serverless] Using serverless-compatible pre_execute")
+            try:
+                self.sess = _pyspark.sql.SparkSession.builder.getOrCreate()
+                print("[Flyte Serverless] ✓ Got SparkSession successfully")
+            except Exception as e:
+                print(f"[Flyte Serverless] Warning: Could not get SparkSession: {e}")
+                self.sess = None
+            return user_params.builder().add_attr("SPARK_SESSION", self.sess).build()
+        
+        # Original pre_execute logic for non-serverless environments follows'''
+        
+        # Find the original pre_execute method definition
+        import re
+        
+        # Pattern to find "def pre_execute(self, user_params: ExecutionParameters)"
+        pattern = r'(\n    def pre_execute\(self, user_params: ExecutionParameters\)[^:]*:)'
+        
+        if re.search(pattern, content):
+            # Replace the method signature with our patched version + original
+            patched_content = re.sub(
+                pattern,
+                patch_code,
+                content,
+                count=1
+            )
+            
+            # Write the patched file
+            with open(task_file, 'w') as f:
+                f.write(patched_content)
+            
+            print("[Flyte Serverless] ✓ Patched spark plugin on disk successfully")
+            
+            # Reload the module to pick up changes
+            import importlib
+            importlib.reload(task_module)
+            
+            return True
+        else:
+            print("[Flyte Serverless] WARNING: Could not find pre_execute method to patch")
+            return False
+            
+    except ImportError as e:
+        print(f"[Flyte Serverless] Could not find spark plugin to patch: {e}")
+        return False
+    except PermissionError as e:
+        print(f"[Flyte Serverless] Permission denied patching plugin: {e}")
+        return False
+    except Exception as e:
+        print(f"[Flyte Serverless] Error patching spark plugin: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def patch_spark_plugin_for_serverless():
     """
-    Monkey-patch the flytekitplugins-spark plugin to work with Databricks serverless.
+    Patch the flytekitplugins-spark plugin for Databricks serverless.
     
-    The standard plugin's pre_execute tries to create a SparkSession with configuration
-    that doesn't work with Spark Connect in serverless. This patch replaces the
-    pre_execute method with a serverless-compatible version.
+    First tries to patch the file on disk (for subprocess compatibility),
+    then falls back to in-memory patching.
     """
+    # Try disk patching first (works across subprocesses)
+    if patch_spark_plugin_on_disk():
+        return
+    
+    # Fallback to in-memory patching
+    print("[Flyte Serverless] Falling back to in-memory patching")
     try:
         from flytekitplugins.spark.task import PysparkFunctionTask
         from flytekit.core.context_manager import ExecutionParameters
-        
-        original_pre_execute = PysparkFunctionTask.pre_execute
         
         def serverless_pre_execute(self, user_params: ExecutionParameters) -> ExecutionParameters:
             """Serverless-compatible pre_execute that handles Spark Connect properly."""
@@ -248,20 +339,16 @@ def patch_spark_plugin_for_serverless():
             print("[Flyte Serverless] Using patched pre_execute for Spark Connect compatibility")
             
             try:
-                # In Databricks serverless, SparkSession is pre-configured
-                # Just get it without any custom configuration
                 self.sess = _pyspark.sql.SparkSession.builder.getOrCreate()
                 print(f"[Flyte Serverless] Got SparkSession successfully")
             except Exception as e:
                 print(f"[Flyte Serverless] Warning: Could not get SparkSession: {e}")
-                # For tasks that don't need Spark, continue without it
                 self.sess = None
             
             return user_params.builder().add_attr("SPARK_SESSION", self.sess).build()
         
-        # Replace the pre_execute method
         PysparkFunctionTask.pre_execute = serverless_pre_execute
-        print("[Flyte Serverless] ✓ Patched flytekitplugins-spark for serverless compatibility")
+        print("[Flyte Serverless] ✓ Patched flytekitplugins-spark in-memory")
         
     except ImportError as e:
         print(f"[Flyte Serverless] Could not patch spark plugin (not installed?): {e}")
