@@ -318,12 +318,13 @@ def execute_flyte_command_inprocess(args: list):
     try:
         if cmd == "pyflyte-fast-execute":
             # Run pyflyte-fast-execute in-process
-            from flytekit.clis.sdk_in_container import fast_execute
+            # The command is defined in flytekit.bin.entrypoint
+            from flytekit.bin.entrypoint import fast_execute_task_cmd
             # Set up sys.argv for click
             old_argv = sys.argv
             sys.argv = [cmd] + cmd_args
             try:
-                fast_execute.fast_execute_task_cmd(standalone_mode=False)
+                fast_execute_task_cmd(standalone_mode=False)
                 return 0
             except SystemExit as e:
                 return e.code if e.code is not None else 0
@@ -337,11 +338,12 @@ def execute_flyte_command_inprocess(args: list):
                 
         elif cmd == "pyflyte-execute":
             # Run pyflyte-execute in-process
-            from flytekit.clis.sdk_in_container import execute
+            # The command is defined in flytekit.bin.entrypoint
+            from flytekit.bin.entrypoint import execute_task_cmd
             old_argv = sys.argv
             sys.argv = [cmd] + cmd_args
             try:
-                execute.execute_task_cmd(standalone_mode=False)
+                execute_task_cmd(standalone_mode=False)
                 return 0
             except SystemExit as e:
                 return e.code if e.code is not None else 0
