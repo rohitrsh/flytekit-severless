@@ -282,17 +282,28 @@ def patch_spark_plugin_on_disk():
                 except Exception as e:
                     print(f"[Flyte Serverless] builtins.spark failed: {e}")
             
-            # Method 3: Connect using SPARK_REMOTE env var (Unix socket for serverless)
+            # Method 3: Use Databricks' built-in PySpark (supports Unix socket)
             if not self.sess:
-                spark_remote = os.environ.get("SPARK_REMOTE")
-                if spark_remote:
-                    try:
-                        from pyspark.sql import SparkSession
-                        # Use remote() to connect via Spark Connect
-                        self.sess = SparkSession.builder.remote(spark_remote).getOrCreate()
-                        print(f"[Flyte Serverless] ✓ Connected via SPARK_REMOTE: {spark_remote[:50]}...")
-                    except Exception as e:
-                        print(f"[Flyte Serverless] SPARK_REMOTE connection failed: {e}")
+                try:
+                    # Databricks' PySpark is at /databricks/python and knows how to handle SPARK_REMOTE
+                    import sys
+                    databricks_pyspark = "/databricks/python/lib/python3.12/site-packages"
+                    if databricks_pyspark not in sys.path:
+                        sys.path.insert(0, databricks_pyspark)
+                    
+                    # Force reimport from Databricks location
+                    import importlib
+                    if 'pyspark' in sys.modules:
+                        # Remove pip-installed pyspark from modules cache
+                        pyspark_modules = [k for k in sys.modules.keys() if k.startswith('pyspark')]
+                        for mod in pyspark_modules:
+                            del sys.modules[mod]
+                    
+                    from pyspark.sql import SparkSession as DBSparkSession
+                    self.sess = DBSparkSession.builder.getOrCreate()
+                    print("[Flyte Serverless] ✓ Got SparkSession from Databricks PySpark")
+                except Exception as e:
+                    print(f"[Flyte Serverless] Databricks PySpark connection failed: {e}")
             
             # Method 4: For tasks that don't need Spark, just continue without it
             if not self.sess:
@@ -387,16 +398,24 @@ def patch_spark_plugin_for_serverless():
                 except Exception as e:
                     print(f"[Flyte Serverless] builtins.spark failed: {e}")
             
-            # Try SPARK_REMOTE env var
+            # Try Databricks' built-in PySpark
             if not self.sess:
-                import os
-                spark_remote = os.environ.get("SPARK_REMOTE")
-                if spark_remote:
-                    try:
-                        self.sess = SparkSession.builder.remote(spark_remote).getOrCreate()
-                        print(f"[Flyte Serverless] ✓ Connected via SPARK_REMOTE")
-                    except Exception as e:
-                        print(f"[Flyte Serverless] SPARK_REMOTE connection failed: {e}")
+                try:
+                    import sys
+                    databricks_pyspark = "/databricks/python/lib/python3.12/site-packages"
+                    if databricks_pyspark not in sys.path:
+                        sys.path.insert(0, databricks_pyspark)
+                    
+                    # Clear pyspark module cache
+                    pyspark_modules = [k for k in sys.modules.keys() if k.startswith('pyspark')]
+                    for mod in pyspark_modules:
+                        del sys.modules[mod]
+                    
+                    from pyspark.sql import SparkSession as DBSparkSession
+                    self.sess = DBSparkSession.builder.getOrCreate()
+                    print("[Flyte Serverless] ✓ Got SparkSession from Databricks PySpark")
+                except Exception as e:
+                    print(f"[Flyte Serverless] Databricks PySpark failed: {e}")
             
             if not self.sess:
                 print("[Flyte Serverless] No SparkSession available - task will run without Spark")
