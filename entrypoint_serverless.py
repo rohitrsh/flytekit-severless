@@ -295,27 +295,77 @@ def setup_environment():
     return work_dir
 
 
-def execute_flyte_command(args: list):
-    """Execute the Flyte command with the provided arguments."""
+def execute_flyte_command_inprocess(args: list):
+    """
+    Execute the Flyte command in-process (not as subprocess).
+    
+    This is critical for Databricks serverless because:
+    1. Monkey-patches applied in this process persist when running in-process
+    2. Subprocess would start fresh Python without our patches
+    3. The spark plugin patch must be active when pre_execute runs
+    """
     if not args:
         print("[Flyte Serverless] ERROR: No command provided", file=sys.stderr)
-        sys.exit(1)
-    
-    # Log the command being executed
-    cmd_str = " ".join(args)
-    print(f"[Flyte Serverless] Executing: {cmd_str}")
-    
-    # Execute the command
-    try:
-        result = subprocess.run(
-            args,
-            check=False,
-            env=os.environ.copy(),
-        )
-        return result.returncode
-    except Exception as e:
-        print(f"[Flyte Serverless] ERROR: Failed to execute command: {e}", file=sys.stderr)
         return 1
+    
+    cmd_str = " ".join(args)
+    print(f"[Flyte Serverless] Executing in-process: {cmd_str}")
+    
+    # Determine which command to run
+    cmd = args[0]
+    cmd_args = args[1:]
+    
+    try:
+        if cmd == "pyflyte-fast-execute":
+            # Run pyflyte-fast-execute in-process
+            from flytekit.clis.sdk_in_container import fast_execute
+            # Set up sys.argv for click
+            old_argv = sys.argv
+            sys.argv = [cmd] + cmd_args
+            try:
+                fast_execute.fast_execute_task_cmd(standalone_mode=False)
+                return 0
+            except SystemExit as e:
+                return e.code if e.code is not None else 0
+            except Exception as e:
+                print(f"[Flyte Serverless] ERROR in fast_execute: {e}")
+                import traceback
+                traceback.print_exc()
+                return 1
+            finally:
+                sys.argv = old_argv
+                
+        elif cmd == "pyflyte-execute":
+            # Run pyflyte-execute in-process
+            from flytekit.clis.sdk_in_container import execute
+            old_argv = sys.argv
+            sys.argv = [cmd] + cmd_args
+            try:
+                execute.execute_task_cmd(standalone_mode=False)
+                return 0
+            except SystemExit as e:
+                return e.code if e.code is not None else 0
+            except Exception as e:
+                print(f"[Flyte Serverless] ERROR in execute: {e}")
+                import traceback
+                traceback.print_exc()
+                return 1
+            finally:
+                sys.argv = old_argv
+        else:
+            # Unknown command - fall back to subprocess (patch won't work but try anyway)
+            print(f"[Flyte Serverless] WARNING: Unknown command '{cmd}', falling back to subprocess")
+            result = subprocess.run(args, check=False, env=os.environ.copy())
+            return result.returncode
+            
+    except ImportError as e:
+        print(f"[Flyte Serverless] ERROR: Could not import flytekit modules: {e}")
+        return 1
+
+
+def execute_flyte_command(args: list):
+    """Execute the Flyte command - delegates to in-process execution."""
+    return execute_flyte_command_inprocess(args)
 
 
 def main():
