@@ -229,6 +229,11 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
 
 def setup_environment():
     """Set up the working environment for serverless compute."""
+    # Mark this as Databricks serverless for plugin compatibility
+    # This helps plugins know to use Spark Connect instead of classic Spark
+    os.environ["DATABRICKS_SERVERLESS"] = "true"
+    os.environ["SPARK_CONNECT_MODE"] = "true"
+    
     # Use /tmp for serverless - it's always writable
     # Unlike /root which is not accessible in serverless
     work_dir = os.environ.get("FLYTE_INTERNAL_WORK_DIR", "/tmp/flyte")
