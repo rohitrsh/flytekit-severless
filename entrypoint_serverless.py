@@ -227,12 +227,56 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
         return False
 
 
+def patch_spark_plugin_for_serverless():
+    """
+    Monkey-patch the flytekitplugins-spark plugin to work with Databricks serverless.
+    
+    The standard plugin's pre_execute tries to create a SparkSession with configuration
+    that doesn't work with Spark Connect in serverless. This patch replaces the
+    pre_execute method with a serverless-compatible version.
+    """
+    try:
+        from flytekitplugins.spark.task import PysparkFunctionTask
+        from flytekit.core.context_manager import ExecutionParameters
+        
+        original_pre_execute = PysparkFunctionTask.pre_execute
+        
+        def serverless_pre_execute(self, user_params: ExecutionParameters) -> ExecutionParameters:
+            """Serverless-compatible pre_execute that handles Spark Connect properly."""
+            import pyspark as _pyspark
+            
+            print("[Flyte Serverless] Using patched pre_execute for Spark Connect compatibility")
+            
+            try:
+                # In Databricks serverless, SparkSession is pre-configured
+                # Just get it without any custom configuration
+                self.sess = _pyspark.sql.SparkSession.builder.getOrCreate()
+                print(f"[Flyte Serverless] Got SparkSession successfully")
+            except Exception as e:
+                print(f"[Flyte Serverless] Warning: Could not get SparkSession: {e}")
+                # For tasks that don't need Spark, continue without it
+                self.sess = None
+            
+            return user_params.builder().add_attr("SPARK_SESSION", self.sess).build()
+        
+        # Replace the pre_execute method
+        PysparkFunctionTask.pre_execute = serverless_pre_execute
+        print("[Flyte Serverless] ✓ Patched flytekitplugins-spark for serverless compatibility")
+        
+    except ImportError as e:
+        print(f"[Flyte Serverless] Could not patch spark plugin (not installed?): {e}")
+    except Exception as e:
+        print(f"[Flyte Serverless] Warning: Failed to patch spark plugin: {e}")
+
+
 def setup_environment():
     """Set up the working environment for serverless compute."""
     # Mark this as Databricks serverless for plugin compatibility
-    # This helps plugins know to use Spark Connect instead of classic Spark
     os.environ["DATABRICKS_SERVERLESS"] = "true"
     os.environ["SPARK_CONNECT_MODE"] = "true"
+    
+    # Patch the spark plugin to work with serverless Spark Connect
+    patch_spark_plugin_for_serverless()
     
     # Use /tmp for serverless - it's always writable
     # Unlike /root which is not accessible in serverless
