@@ -184,6 +184,72 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
         return False
 
 
+def setup_spark_session():
+    """
+    Pre-initialize SparkSession and inject it into builtins.
+    
+    This ensures the Flyte plugin can find the SparkSession via builtins.spark,
+    which is the standard Databricks way of exposing the pre-configured session.
+    """
+    import builtins
+    
+    # Check if spark is already in builtins
+    if hasattr(builtins, 'spark'):
+        print(f"[Flyte] SparkSession already in builtins: {builtins.spark}")
+        return builtins.spark
+    
+    spark_remote = os.environ.get("SPARK_REMOTE")
+    if not spark_remote:
+        print("[Flyte] SPARK_REMOTE not set - cannot initialize SparkSession")
+        return None
+    
+    print(f"[Flyte] SPARK_REMOTE: {spark_remote}")
+    
+    try:
+        # Use Databricks' PySpark which understands the Unix socket format
+        import sys
+        db_paths = [
+            "/databricks/python/lib/python3.12/site-packages",
+            "/databricks/python/lib/python3.11/site-packages", 
+            "/databricks/python/lib/python3.10/site-packages",
+        ]
+        
+        # Insert Databricks paths at the beginning so they take precedence
+        for db_path in db_paths:
+            if os.path.exists(db_path):
+                if db_path in sys.path:
+                    sys.path.remove(db_path)
+                sys.path.insert(0, db_path)
+                print(f"[Flyte] Prioritized Databricks PySpark: {db_path}")
+                break
+        
+        from pyspark.sql import SparkSession
+        
+        # First try to get an active session
+        active = SparkSession.getActiveSession()
+        if active:
+            print(f"[Flyte] Got active SparkSession: {active}")
+            builtins.spark = active
+            return active
+        
+        # Create session using SPARK_REMOTE
+        print("[Flyte] Creating SparkSession via SPARK_REMOTE...")
+        spark = SparkSession.builder.remote(spark_remote).getOrCreate()
+        print(f"[Flyte] ✓ SparkSession created: {spark}")
+        
+        # Inject into builtins so plugin can find it
+        builtins.spark = spark
+        print("[Flyte] ✓ SparkSession injected into builtins")
+        
+        return spark
+        
+    except Exception as e:
+        print(f"[Flyte] WARNING: Could not initialize SparkSession: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def setup_environment():
     """Set up the working environment for serverless compute."""
     # Mark this as Databricks serverless for plugin compatibility
@@ -266,6 +332,14 @@ def main():
     
     # Set up the working environment (sets DATABRICKS_SERVERLESS=true)
     work_dir = setup_environment()
+    
+    # Pre-initialize SparkSession and inject into builtins
+    # This ensures the Flyte plugin can find it
+    spark = setup_spark_session()
+    if spark:
+        print("[Flyte] SparkSession ready for Flyte tasks")
+    else:
+        print("[Flyte] ⚠ No SparkSession - Spark operations may fail")
     
     # Execute the Flyte command with remaining arguments
     return_code = execute_flyte_command(remaining_args)
