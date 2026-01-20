@@ -6,11 +6,10 @@ This entrypoint is designed to work with Databricks Serverless Compute,
 which has restrictions on accessing certain directories like /root and
 does not provide standard AWS credentials via instance metadata.
 
-Key differences from the classic entrypoint:
+Key features:
 - Uses /tmp as the working directory (accessible in serverless)
-- Handles the restricted serverless environment
-- Compatible with Spark Connect APIs
 - Configures AWS credentials from Databricks service credentials
+- Works with flytekitplugins-spark-dev which has native serverless support
 
 Credential Provider Configuration (in order of precedence):
     1. Command-line argument: --flyte-credential-provider=<name>
@@ -48,9 +47,6 @@ def parse_credential_provider_from_args():
     Looks for --flyte-credential-provider=<name> anywhere in sys.argv
     and removes it from the args list.
     
-    The argument can be at any position (typically at the end to avoid
-    breaking pyflyte-fast-execute which must be the first argument).
-    
     Returns:
         tuple: (credential_provider, remaining_args)
     """
@@ -71,10 +67,10 @@ def parse_credential_provider_from_args():
 
 
 def debug_print_environment():
-    """Print all environment variables for debugging."""
-    print("[Flyte Serverless] === DEBUG: All Environment Variables ===")
+    """Print relevant environment variables for debugging."""
+    print("[Flyte Serverless] === Environment Variables ===")
     relevant_vars = []
-    other_vars = []
+    other_count = 0
     
     for key in sorted(os.environ.keys()):
         value = os.environ[key]
@@ -83,52 +79,17 @@ def debug_print_environment():
             if len(value) > 8:
                 value = value[:4] + "****" + value[-4:]
         
-        # Categorize
+        # Only show relevant vars
         if any(x in key.upper() for x in ['AWS', 'FLYTE', 'DATABRICKS', 'S3', 'SPARK']):
             relevant_vars.append(f"  {key}={value}")
         else:
-            other_vars.append(f"  {key}={value}")
+            other_count += 1
     
-    print("[Flyte Serverless] Relevant variables:")
     for v in relevant_vars:
         print(f"[Flyte Serverless] {v}")
     
-    print(f"[Flyte Serverless] + {len(other_vars)} other variables")
+    print(f"[Flyte Serverless] + {other_count} other variables")
     print("[Flyte Serverless] === END Environment Variables ===")
-
-
-def try_get_credential_provider_from_spark_conf():
-    """
-    Try to get the credential provider name from Spark configuration.
-    
-    Databricks serverless might pass environment_vars through Spark conf
-    instead of OS environment variables.
-    """
-    try:
-        from pyspark.sql import SparkSession
-        spark = SparkSession.builder.getOrCreate()
-        
-        # Try to get all Spark conf and look for our variable
-        print("[Flyte Serverless] Checking Spark configuration...")
-        
-        all_conf = spark.sparkContext.getConf().getAll()
-        for key, value in all_conf:
-            if 'credential' in key.lower() or 'DATABRICKS' in key.upper():
-                print(f"[Flyte Serverless] Spark conf: {key}={value}")
-        
-        # Try common Spark conf locations
-        try:
-            provider = spark.conf.get("spark.databricks.service.credential.provider")
-            if provider:
-                print(f"[Flyte Serverless] Found credential provider in Spark conf: {provider}")
-                return provider
-        except Exception:
-            pass
-            
-    except Exception as e:
-        print(f"[Flyte Serverless] Could not inspect Spark conf: {e}")
-    
-    return None
 
 
 def setup_aws_credentials_from_databricks(credential_provider: str = None):
@@ -150,18 +111,14 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
         credential_provider = os.environ.get("DATABRICKS_SERVICE_CREDENTIAL_PROVIDER")
     
     if not credential_provider:
-        print("[Flyte Serverless] Credential provider not in env vars, trying Spark conf...")
-        credential_provider = try_get_credential_provider_from_spark_conf()
-    
-    if not credential_provider:
         if DEFAULT_CREDENTIAL_PROVIDER:
-            print(f"[Flyte Serverless] Using hardcoded fallback credential provider: {DEFAULT_CREDENTIAL_PROVIDER}")
+            print(f"[Flyte Serverless] Using fallback credential provider: {DEFAULT_CREDENTIAL_PROVIDER}")
             credential_provider = DEFAULT_CREDENTIAL_PROVIDER
         else:
-            print("[Flyte Serverless] WARNING: No credential provider found")
-            print("[Flyte Serverless] Options to fix:")
-            print("[Flyte Serverless]   1. Set DEFAULT_CREDENTIAL_PROVIDER in entrypoint_serverless.py")
-            print("[Flyte Serverless]   2. Pass --flyte-credential-provider=<name> in spark_python_task parameters")
+            print("[Flyte Serverless] WARNING: No credential provider configured")
+            print("[Flyte Serverless] S3 access may fail. Options to fix:")
+            print("[Flyte Serverless]   1. Set DEFAULT_CREDENTIAL_PROVIDER in this script")
+            print("[Flyte Serverless]   2. Pass --flyte-credential-provider=<name> argument")
             print("[Flyte Serverless]   3. Set DATABRICKS_SERVICE_CREDENTIAL_PROVIDER env var")
             return False
     
@@ -172,7 +129,7 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
         from pyspark.dbutils import DBUtils
         from pyspark.sql import SparkSession
         
-        # Get SparkSession (should be available in serverless context)
+        # Get SparkSession (pre-configured in serverless)
         spark = SparkSession.builder.getOrCreate()
         dbutils = DBUtils(spark)
         
@@ -204,7 +161,7 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
         if region:
             os.environ["AWS_DEFAULT_REGION"] = region
         
-        # Verify credentials are working by checking caller identity
+        # Verify credentials are working
         try:
             sts_client = session.client("sts")
             identity = sts_client.get_caller_identity()
@@ -227,218 +184,12 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
         return False
 
 
-def patch_spark_plugin_on_disk():
-    """
-    Patch the installed flytekitplugins-spark plugin file on disk.
-    
-    This is necessary because fast_execute_task_cmd spawns a subprocess,
-    and in-memory patches don't survive across processes. By patching
-    the actual file, subprocesses will import the patched version.
-    """
-    try:
-        import flytekitplugins.spark.task as task_module
-        task_file = task_module.__file__
-        
-        print(f"[Flyte Serverless] Patching spark plugin at: {task_file}")
-        
-        with open(task_file, 'r') as f:
-            content = f.read()
-        
-        # Check if already patched
-        if "SERVERLESS_PATCHED" in content:
-            print("[Flyte Serverless] ✓ Spark plugin already patched on disk")
-            return True
-        
-        # Find the pre_execute method and replace it
-        # The original code has this pattern in the pre_execute method:
-        # sess_builder = ... (building SparkSession with configs)
-        # self.sess = sess_builder.getOrCreate()
-        
-        # We need to inject a check at the beginning of pre_execute
-        patch_code = '''
-    def pre_execute(self, user_params: ExecutionParameters) -> ExecutionParameters:
-        # SERVERLESS_PATCHED: Modified for Databricks serverless compatibility
-        import os
-        if os.environ.get("DATABRICKS_SERVERLESS") == "true" or os.environ.get("SPARK_CONNECT_MODE_ENABLED") == "1":
-            print("[Flyte Serverless] Using serverless-compatible pre_execute")
-            self.sess = None
-            
-            # Method 1: Try to get the active session (already initialized by Databricks)
-            try:
-                from pyspark.sql import SparkSession
-                self.sess = SparkSession.getActiveSession()
-                if self.sess:
-                    print("[Flyte Serverless] ✓ Got active SparkSession")
-            except Exception as e:
-                print(f"[Flyte Serverless] getActiveSession failed: {e}")
-            
-            # Method 2: Try to get 'spark' from the Databricks runtime globals
-            if not self.sess:
-                try:
-                    import builtins
-                    if hasattr(builtins, 'spark'):
-                        self.sess = builtins.spark
-                        print("[Flyte Serverless] ✓ Got SparkSession from builtins.spark")
-                except Exception as e:
-                    print(f"[Flyte Serverless] builtins.spark failed: {e}")
-            
-            # Method 3: Use Databricks' built-in PySpark (supports Unix socket)
-            if not self.sess:
-                try:
-                    # Databricks' PySpark is at /databricks/python and knows how to handle SPARK_REMOTE
-                    import sys
-                    databricks_pyspark = "/databricks/python/lib/python3.12/site-packages"
-                    if databricks_pyspark not in sys.path:
-                        sys.path.insert(0, databricks_pyspark)
-                    
-                    # Force reimport from Databricks location
-                    import importlib
-                    if 'pyspark' in sys.modules:
-                        # Remove pip-installed pyspark from modules cache
-                        pyspark_modules = [k for k in sys.modules.keys() if k.startswith('pyspark')]
-                        for mod in pyspark_modules:
-                            del sys.modules[mod]
-                    
-                    from pyspark.sql import SparkSession as DBSparkSession
-                    self.sess = DBSparkSession.builder.getOrCreate()
-                    print("[Flyte Serverless] ✓ Got SparkSession from Databricks PySpark")
-                except Exception as e:
-                    print(f"[Flyte Serverless] Databricks PySpark connection failed: {e}")
-            
-            # Method 4: For tasks that don't need Spark, just continue without it
-            if not self.sess:
-                print("[Flyte Serverless] No SparkSession available - task will run without Spark")
-            
-            return user_params.builder().add_attr("SPARK_SESSION", self.sess).build()
-        
-        # Original pre_execute logic for non-serverless environments follows'''
-        
-        # Find the original pre_execute method definition
-        import re
-        
-        # Pattern to find "def pre_execute(self, user_params: ExecutionParameters)"
-        pattern = r'(\n    def pre_execute\(self, user_params: ExecutionParameters\)[^:]*:)'
-        
-        if re.search(pattern, content):
-            # Replace the method signature with our patched version + original
-            patched_content = re.sub(
-                pattern,
-                patch_code,
-                content,
-                count=1
-            )
-            
-            # Write the patched file
-            with open(task_file, 'w') as f:
-                f.write(patched_content)
-            
-            print("[Flyte Serverless] ✓ Patched spark plugin on disk successfully")
-            
-            # Reload the module to pick up changes
-            import importlib
-            importlib.reload(task_module)
-            
-            return True
-        else:
-            print("[Flyte Serverless] WARNING: Could not find pre_execute method to patch")
-            return False
-            
-    except ImportError as e:
-        print(f"[Flyte Serverless] Could not find spark plugin to patch: {e}")
-        return False
-    except PermissionError as e:
-        print(f"[Flyte Serverless] Permission denied patching plugin: {e}")
-        return False
-    except Exception as e:
-        print(f"[Flyte Serverless] Error patching spark plugin: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def patch_spark_plugin_for_serverless():
-    """
-    Patch the flytekitplugins-spark plugin for Databricks serverless.
-    
-    First tries to patch the file on disk (for subprocess compatibility),
-    then falls back to in-memory patching.
-    """
-    # Try disk patching first (works across subprocesses)
-    if patch_spark_plugin_on_disk():
-        return
-    
-    # Fallback to in-memory patching
-    print("[Flyte Serverless] Falling back to in-memory patching")
-    try:
-        from flytekitplugins.spark.task import PysparkFunctionTask
-        from flytekit.core.context_manager import ExecutionParameters
-        
-        def serverless_pre_execute(self, user_params: ExecutionParameters) -> ExecutionParameters:
-            """Serverless-compatible pre_execute that handles Spark Connect properly."""
-            from pyspark.sql import SparkSession
-            
-            print("[Flyte Serverless] Using patched pre_execute for Spark Connect compatibility")
-            self.sess = None
-            
-            # Try to get the active session (already initialized by Databricks)
-            try:
-                self.sess = SparkSession.getActiveSession()
-                if self.sess:
-                    print("[Flyte Serverless] ✓ Got active SparkSession")
-            except Exception as e:
-                print(f"[Flyte Serverless] getActiveSession failed: {e}")
-            
-            # Try to get 'spark' from builtins
-            if not self.sess:
-                try:
-                    import builtins
-                    if hasattr(builtins, 'spark'):
-                        self.sess = builtins.spark
-                        print("[Flyte Serverless] ✓ Got SparkSession from builtins.spark")
-                except Exception as e:
-                    print(f"[Flyte Serverless] builtins.spark failed: {e}")
-            
-            # Try Databricks' built-in PySpark
-            if not self.sess:
-                try:
-                    import sys
-                    databricks_pyspark = "/databricks/python/lib/python3.12/site-packages"
-                    if databricks_pyspark not in sys.path:
-                        sys.path.insert(0, databricks_pyspark)
-                    
-                    # Clear pyspark module cache
-                    pyspark_modules = [k for k in sys.modules.keys() if k.startswith('pyspark')]
-                    for mod in pyspark_modules:
-                        del sys.modules[mod]
-                    
-                    from pyspark.sql import SparkSession as DBSparkSession
-                    self.sess = DBSparkSession.builder.getOrCreate()
-                    print("[Flyte Serverless] ✓ Got SparkSession from Databricks PySpark")
-                except Exception as e:
-                    print(f"[Flyte Serverless] Databricks PySpark failed: {e}")
-            
-            if not self.sess:
-                print("[Flyte Serverless] No SparkSession available - task will run without Spark")
-            
-            return user_params.builder().add_attr("SPARK_SESSION", self.sess).build()
-        
-        PysparkFunctionTask.pre_execute = serverless_pre_execute
-        print("[Flyte Serverless] ✓ Patched flytekitplugins-spark in-memory")
-        
-    except ImportError as e:
-        print(f"[Flyte Serverless] Could not patch spark plugin (not installed?): {e}")
-    except Exception as e:
-        print(f"[Flyte Serverless] Warning: Failed to patch spark plugin: {e}")
-
-
 def setup_environment():
     """Set up the working environment for serverless compute."""
     # Mark this as Databricks serverless for plugin compatibility
+    # The flytekitplugins-spark-dev plugin checks these env vars
     os.environ["DATABRICKS_SERVERLESS"] = "true"
     os.environ["SPARK_CONNECT_MODE"] = "true"
-    
-    # Patch the spark plugin to work with serverless Spark Connect
-    patch_spark_plugin_for_serverless()
     
     # Use /tmp for serverless - it's always writable
     # Unlike /root which is not accessible in serverless
@@ -457,85 +208,35 @@ def setup_environment():
     return work_dir
 
 
-def execute_flyte_command_inprocess(args: list):
+def execute_flyte_command(args: list):
     """
-    Execute the Flyte command in-process (not as subprocess).
+    Execute the Flyte command.
     
-    This is critical for Databricks serverless because:
-    1. Monkey-patches applied in this process persist when running in-process
-    2. Subprocess would start fresh Python without our patches
-    3. The spark plugin patch must be active when pre_execute runs
+    Uses subprocess to run pyflyte commands. The flytekitplugins-spark-dev
+    plugin has native serverless support, so no patching is needed.
     """
     if not args:
         print("[Flyte Serverless] ERROR: No command provided", file=sys.stderr)
         return 1
     
     cmd_str = " ".join(args)
-    print(f"[Flyte Serverless] Executing in-process: {cmd_str}")
-    
-    # Determine which command to run
-    cmd = args[0]
-    cmd_args = args[1:]
+    print(f"[Flyte Serverless] Executing: {cmd_str}")
     
     try:
-        if cmd == "pyflyte-fast-execute":
-            # Run pyflyte-fast-execute in-process
-            # The command is defined in flytekit.bin.entrypoint
-            from flytekit.bin.entrypoint import fast_execute_task_cmd
-            # Set up sys.argv for click
-            old_argv = sys.argv
-            sys.argv = [cmd] + cmd_args
-            try:
-                fast_execute_task_cmd(standalone_mode=False)
-                return 0
-            except SystemExit as e:
-                return e.code if e.code is not None else 0
-            except Exception as e:
-                print(f"[Flyte Serverless] ERROR in fast_execute: {e}")
-                import traceback
-                traceback.print_exc()
-                return 1
-            finally:
-                sys.argv = old_argv
-                
-        elif cmd == "pyflyte-execute":
-            # Run pyflyte-execute in-process
-            # The command is defined in flytekit.bin.entrypoint
-            from flytekit.bin.entrypoint import execute_task_cmd
-            old_argv = sys.argv
-            sys.argv = [cmd] + cmd_args
-            try:
-                execute_task_cmd(standalone_mode=False)
-                return 0
-            except SystemExit as e:
-                return e.code if e.code is not None else 0
-            except Exception as e:
-                print(f"[Flyte Serverless] ERROR in execute: {e}")
-                import traceback
-                traceback.print_exc()
-                return 1
-            finally:
-                sys.argv = old_argv
-        else:
-            # Unknown command - fall back to subprocess (patch won't work but try anyway)
-            print(f"[Flyte Serverless] WARNING: Unknown command '{cmd}', falling back to subprocess")
-            result = subprocess.run(args, check=False, env=os.environ.copy())
-            return result.returncode
-            
-    except ImportError as e:
-        print(f"[Flyte Serverless] ERROR: Could not import flytekit modules: {e}")
+        result = subprocess.run(
+            args,
+            check=False,
+            env=os.environ.copy(),
+        )
+        return result.returncode
+    except Exception as e:
+        print(f"[Flyte Serverless] ERROR: Failed to execute command: {e}", file=sys.stderr)
         return 1
-
-
-def execute_flyte_command(args: list):
-    """Execute the Flyte command - delegates to in-process execution."""
-    return execute_flyte_command_inprocess(args)
 
 
 def is_running_in_ipython():
     """Check if we're running inside IPython/Jupyter/Databricks notebook."""
     try:
-        # Check for IPython
         get_ipython()  # noqa: F821
         return True
     except NameError:
@@ -563,9 +264,9 @@ def main():
     credentials_configured = setup_aws_credentials_from_databricks(credential_provider)
     if not credentials_configured:
         print("[Flyte Serverless] ⚠ WARNING: Running without Databricks-managed AWS credentials")
-        print("[Flyte Serverless] S3 operations will likely fail!")
+        print("[Flyte Serverless] S3 operations may fail!")
     
-    # Set up the working environment
+    # Set up the working environment (sets DATABRICKS_SERVERLESS=true)
     work_dir = setup_environment()
     
     # Execute the Flyte command with remaining arguments
@@ -577,13 +278,10 @@ def main():
     
     # In IPython/Databricks notebook context, sys.exit() raises SystemExit which
     # appears as a traceback and may be interpreted as an error by Databricks.
-    # Instead, just return the code - Databricks will pick it up from the task result.
     if is_running_in_ipython():
         print(f"[Flyte Serverless] Running in IPython context, not calling sys.exit()")
         if return_code != 0:
-            # For non-zero exit, raise an exception that clearly indicates failure
             raise RuntimeError(f"Flyte task failed with return code: {return_code}")
-        # For success (return_code == 0), just return normally
         return return_code
     else:
         sys.exit(return_code)
