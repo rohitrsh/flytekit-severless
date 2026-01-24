@@ -292,48 +292,25 @@ def execute_flyte_command_inprocess(args: list):
     print(f"[Flyte] Executing in-process: {cmd_str}")
     
     try:
-        # Import Flyte's entrypoint functions
+        # Import Flyte's entrypoint functions (these are Click commands)
         from flytekit.bin.entrypoint import fast_execute_task_cmd, execute_task_cmd
         
         if cmd == "pyflyte-fast-execute":
-            # Parse pyflyte-fast-execute arguments
-            # Format: pyflyte-fast-execute --additional-distribution <url> --dest-dir <dir> -- pyflyte-execute ...
-            try:
-                separator_idx = args.index("--")
-                fast_args = args[1:separator_idx]  # Args before --
-                execute_args = args[separator_idx + 1:]  # Args after --
-            except ValueError:
-                print("[Flyte] ERROR: Could not find -- separator in args")
-                return 1
+            # fast_execute_task_cmd is a Click command - invoke with standalone_mode=False
+            # to prevent sys.exit() and get proper return values
+            # Args format: --additional-distribution <url> --dest-dir <dir> -- pyflyte-execute ...
+            click_args = args[1:]  # Remove the command name, keep the rest
+            print(f"[Flyte] Invoking fast_execute_task_cmd with args: {click_args}")
             
-            # Parse fast execute args
-            additional_distribution = None
-            dest_dir = "."
-            i = 0
-            while i < len(fast_args):
-                if fast_args[i] == "--additional-distribution" and i + 1 < len(fast_args):
-                    additional_distribution = fast_args[i + 1]
-                    i += 2
-                elif fast_args[i] == "--dest-dir" and i + 1 < len(fast_args):
-                    dest_dir = fast_args[i + 1]
-                    i += 2
-                else:
-                    i += 1
-            
-            print(f"[Flyte] Fast execute: distribution={additional_distribution}, dest={dest_dir}")
-            print(f"[Flyte] Execute args: {execute_args}")
-            
-            # Call fast_execute_task_cmd
-            fast_execute_task_cmd(
-                additional_distribution=additional_distribution,
-                dest_dir=dest_dir,
-                arg=execute_args
-            )
+            result = fast_execute_task_cmd.main(click_args, standalone_mode=False)
             return 0
             
         elif cmd == "pyflyte-execute":
-            # Direct execute (no fast distribution)
-            execute_task_cmd(arg=args[1:])
+            # execute_task_cmd is also a Click command
+            click_args = args[1:]
+            print(f"[Flyte] Invoking execute_task_cmd with args: {click_args}")
+            
+            result = execute_task_cmd.main(click_args, standalone_mode=False)
             return 0
             
         else:
@@ -343,8 +320,12 @@ def execute_flyte_command_inprocess(args: list):
             return result.returncode
             
     except SystemExit as e:
-        # Flyte commands often call sys.exit() - capture the exit code
-        return e.code if e.code is not None else 0
+        # Click commands may still call sys.exit() even with standalone_mode=False
+        code = e.code if e.code is not None else 0
+        if code == 0:
+            return 0
+        print(f"[Flyte] Command exited with code: {code}")
+        return code
     except Exception as e:
         print(f"[Flyte] ERROR: In-process execution failed: {e}", file=sys.stderr)
         import traceback
