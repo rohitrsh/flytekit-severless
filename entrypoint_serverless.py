@@ -274,30 +274,89 @@ def setup_environment():
     return work_dir
 
 
-def execute_flyte_command(args: list):
+def execute_flyte_command_inprocess(args: list):
     """
-    Execute the Flyte command.
+    Execute the Flyte command IN-PROCESS (not as subprocess).
     
-    Uses subprocess to run pyflyte commands. The flytekitplugins-spark
-    plugin has native serverless support, so no patching is needed.
+    This is critical because:
+    1. SparkSession is created and injected into builtins by setup_spark_session()
+    2. If we use subprocess, the new process won't have access to builtins.spark
+    3. Running in-process preserves the SparkSession for Flyte tasks
     """
     if not args:
         print("[Flyte] ERROR: No command provided", file=sys.stderr)
         return 1
     
+    cmd = args[0] if args else ""
     cmd_str = " ".join(args)
-    print(f"[Flyte] Executing: {cmd_str}")
+    print(f"[Flyte] Executing in-process: {cmd_str}")
     
     try:
-        result = subprocess.run(
-            args,
-            check=False,
-            env=os.environ.copy(),
-        )
-        return result.returncode
+        # Import Flyte's entrypoint functions
+        from flytekit.bin.entrypoint import fast_execute_task_cmd, execute_task_cmd
+        
+        if cmd == "pyflyte-fast-execute":
+            # Parse pyflyte-fast-execute arguments
+            # Format: pyflyte-fast-execute --additional-distribution <url> --dest-dir <dir> -- pyflyte-execute ...
+            try:
+                separator_idx = args.index("--")
+                fast_args = args[1:separator_idx]  # Args before --
+                execute_args = args[separator_idx + 1:]  # Args after --
+            except ValueError:
+                print("[Flyte] ERROR: Could not find -- separator in args")
+                return 1
+            
+            # Parse fast execute args
+            additional_distribution = None
+            dest_dir = "."
+            i = 0
+            while i < len(fast_args):
+                if fast_args[i] == "--additional-distribution" and i + 1 < len(fast_args):
+                    additional_distribution = fast_args[i + 1]
+                    i += 2
+                elif fast_args[i] == "--dest-dir" and i + 1 < len(fast_args):
+                    dest_dir = fast_args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            
+            print(f"[Flyte] Fast execute: distribution={additional_distribution}, dest={dest_dir}")
+            print(f"[Flyte] Execute args: {execute_args}")
+            
+            # Call fast_execute_task_cmd
+            fast_execute_task_cmd(
+                additional_distribution=additional_distribution,
+                dest_dir=dest_dir,
+                arg=execute_args
+            )
+            return 0
+            
+        elif cmd == "pyflyte-execute":
+            # Direct execute (no fast distribution)
+            execute_task_cmd(arg=args[1:])
+            return 0
+            
+        else:
+            # Fallback to subprocess for unknown commands
+            print(f"[Flyte] Unknown command '{cmd}', falling back to subprocess")
+            result = subprocess.run(args, check=False, env=os.environ.copy())
+            return result.returncode
+            
+    except SystemExit as e:
+        # Flyte commands often call sys.exit() - capture the exit code
+        return e.code if e.code is not None else 0
     except Exception as e:
-        print(f"[Flyte] ERROR: Failed to execute command: {e}", file=sys.stderr)
-        return 1
+        print(f"[Flyte] ERROR: In-process execution failed: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        # Fallback to subprocess
+        print("[Flyte] Falling back to subprocess execution...")
+        try:
+            result = subprocess.run(args, check=False, env=os.environ.copy())
+            return result.returncode
+        except Exception as e2:
+            print(f"[Flyte] ERROR: Subprocess also failed: {e2}", file=sys.stderr)
+            return 1
 
 
 def is_running_in_ipython():
@@ -341,8 +400,9 @@ def main():
     else:
         print("[Flyte] ⚠ No SparkSession - Spark operations may fail")
     
-    # Execute the Flyte command with remaining arguments
-    return_code = execute_flyte_command(remaining_args)
+    # Execute the Flyte command IN-PROCESS (not subprocess)
+    # This preserves the SparkSession in builtins for Flyte tasks
+    return_code = execute_flyte_command_inprocess(remaining_args)
     
     print("[Flyte] " + "=" * 60)
     print(f"[Flyte] Task completed with return code: {return_code}")
