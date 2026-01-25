@@ -313,8 +313,32 @@ def execute_flyte_command_inprocess(args: list):
     print(f"[Flyte] Executing in-process: {cmd_str}")
     
     try:
+        # DIAGNOSTIC: Verify SparkSession is still stored before Flyte import
+        print("[Flyte] === PRE-FLYTE-IMPORT DIAGNOSTIC ===")
+        print(f"[Flyte] _flyte_spark_session in sys.modules: {'_flyte_spark_session' in sys.modules}")
+        if '_flyte_spark_session' in sys.modules:
+            mod = sys.modules['_flyte_spark_session']
+            print(f"[Flyte] _flyte_spark_session.spark: {getattr(mod, 'spark', 'NO ATTR')}")
+        
+        import builtins as _builtins
+        print(f"[Flyte] builtins.spark exists: {hasattr(_builtins, 'spark')}")
+        if hasattr(_builtins, 'spark'):
+            print(f"[Flyte] builtins.spark: {_builtins.spark}")
+        print("[Flyte] === END PRE-FLYTE-IMPORT DIAGNOSTIC ===")
+        
         # Import Flyte's entrypoint functions (these are Click commands)
         from flytekit.bin.entrypoint import fast_execute_task_cmd, execute_task_cmd
+        
+        # DIAGNOSTIC: Verify SparkSession is still stored AFTER Flyte import
+        print("[Flyte] === POST-FLYTE-IMPORT DIAGNOSTIC ===")
+        print(f"[Flyte] _flyte_spark_session in sys.modules: {'_flyte_spark_session' in sys.modules}")
+        if '_flyte_spark_session' in sys.modules:
+            mod = sys.modules['_flyte_spark_session']
+            print(f"[Flyte] _flyte_spark_session.spark: {getattr(mod, 'spark', 'NO ATTR')}")
+        print(f"[Flyte] builtins.spark exists: {hasattr(_builtins, 'spark')}")
+        if hasattr(_builtins, 'spark'):
+            print(f"[Flyte] builtins.spark: {_builtins.spark}")
+        print("[Flyte] === END POST-FLYTE-IMPORT DIAGNOSTIC ===")
         
         if cmd == "pyflyte-fast-execute":
             # fast_execute_task_cmd is a Click command - invoke with standalone_mode=False
