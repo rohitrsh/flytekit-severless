@@ -323,17 +323,16 @@ def download_and_extract_distribution(additional_distribution: str, dest_dir: st
 
 def execute_flyte_task_directly(args: list):
     """
-    Execute Flyte task DIRECTLY - download tarball, import module, run task.
+    Execute Flyte task directly to preserve SparkSession.
     
-    This preserves SparkSession by NOT going through fast_execute_task_cmd
-    which clears Python state when loading the task module.
+    This is the key to making Spark work in Databricks serverless with Flyte.
+    fast_execute_task_cmd clears Python state, losing the SparkSession.
+    By downloading the tarball and importing the module ourselves, we preserve
+    the SparkSession that was created by setup_spark_session().
     """
     import importlib
-    import builtins
     
-    print("[Flyte] === DIRECT TASK EXECUTION ===")
-    
-    # Parse args
+    # Parse args: --additional-distribution <url> --dest-dir <dir> -- pyflyte-execute ...
     additional_distribution = None
     dest_dir = "."
     execute_args = []
@@ -352,114 +351,66 @@ def execute_flyte_task_directly(args: list):
         else:
             i += 1
     
-    # Parse execute_args for task info
+    # Extract task info for logging
     task_module = None
-    task_name = None
-    
     for j, arg in enumerate(execute_args):
         if arg == "task-module" and j + 1 < len(execute_args):
             task_module = execute_args[j + 1]
-        elif arg == "task-name" and j + 1 < len(execute_args):
-            task_name = execute_args[j + 1]
+            break
     
-    print(f"[Flyte] Distribution: {additional_distribution}")
-    print(f"[Flyte] Task: {task_module}.{task_name}")
+    print(f"[Flyte] Executing task: {task_module}")
     
-    # Step 1: Download and extract tarball
+    # Download and extract tarball
     if additional_distribution:
         download_and_extract_distribution(additional_distribution, dest_dir)
     
-    # Step 2: Add to sys.path
+    # Add to sys.path
     abs_dest = os.path.abspath(dest_dir)
     if abs_dest not in sys.path:
         sys.path.insert(0, abs_dest)
-    print(f"[Flyte] Added to path: {abs_dest}")
     
-    # Step 3: Verify SparkSession
-    print(f"[Flyte] SparkSession available: {hasattr(builtins, 'spark')}")
-    if hasattr(builtins, 'spark'):
-        print(f"[Flyte] SparkSession: {builtins.spark}")
+    # Import task module in our context (preserves SparkSession)
+    if task_module:
+        importlib.import_module(task_module)
     
-    # Step 4: Import task module IN OUR CONTEXT
-    print(f"[Flyte] Importing: {task_module}")
-    task_mod = importlib.import_module(task_module)
-    
-    # Step 5: Check SparkSession after import
-    print(f"[Flyte] SparkSession after import: {hasattr(builtins, 'spark')}")
-    
-    # Step 6: Execute via flytekit (it handles inputs/outputs)
+    # Execute via flytekit (handles inputs/outputs)
     from flytekit.bin.entrypoint import execute_task_cmd
-    
-    # Build execute args without fast-execute wrapper
     exec_args = execute_args[1:] if execute_args and execute_args[0] == "pyflyte-execute" else execute_args
-    print(f"[Flyte] Executing task with args: {exec_args[:5]}...")
     
-    result = execute_task_cmd.main(exec_args, standalone_mode=False)
-    print("[Flyte] === DIRECT EXECUTION COMPLETE ===")
+    execute_task_cmd.main(exec_args, standalone_mode=False)
     return 0
 
 
 def execute_flyte_command_inprocess(args: list):
     """
-    Execute the Flyte command IN-PROCESS (not as subprocess).
+    Execute the Flyte command IN-PROCESS to preserve SparkSession.
     
-    This is critical because:
-    1. SparkSession is created and injected into builtins by setup_spark_session()
-    2. If we use subprocess, the new process won't have access to builtins.spark
-    3. Running in-process preserves the SparkSession for Flyte tasks
+    IMPORTANT: We use direct task execution instead of fast_execute_task_cmd
+    because fast_execute_task_cmd clears Python state when loading the task module,
+    which loses the SparkSession created by this entrypoint.
     """
     if not args:
         print("[Flyte] ERROR: No command provided", file=sys.stderr)
         return 1
     
     cmd = args[0] if args else ""
-    cmd_str = " ".join(args)
-    print(f"[Flyte] Executing in-process: {cmd_str}")
     
     try:
-        import builtins as _builtins
-        
-        # DIAGNOSTIC
-        print("[Flyte] === PRE-EXECUTION DIAGNOSTIC ===")
-        print(f"[Flyte] builtins.spark: {hasattr(_builtins, 'spark')}")
-        if hasattr(_builtins, 'spark'):
-            print(f"[Flyte]   value: {_builtins.spark}")
-        print("[Flyte] === END DIAGNOSTIC ===")
-        
         if cmd == "pyflyte-fast-execute":
-            click_args = args[1:]
-            
             # Use DIRECT execution to preserve SparkSession
-            try:
-                return execute_flyte_task_directly(click_args)
-            except Exception as e:
-                print(f"[Flyte] Direct execution failed: {e}")
-                import traceback
-                traceback.print_exc()
-                
-                # Fallback to standard execution
-                print("[Flyte] Falling back to fast_execute_task_cmd...")
-                from flytekit.bin.entrypoint import fast_execute_task_cmd
-                result = fast_execute_task_cmd.main(click_args, standalone_mode=False)
-                return 0
+            return execute_flyte_task_directly(args[1:])
             
         elif cmd == "pyflyte-execute":
             from flytekit.bin.entrypoint import execute_task_cmd
-            click_args = args[1:]
-            result = execute_task_cmd.main(click_args, standalone_mode=False)
-            return 0
+            return execute_task_cmd.main(args[1:], standalone_mode=False) or 0
             
         else:
-            print(f"[Flyte] Unknown command '{cmd}', falling back to subprocess")
+            print(f"[Flyte] Unknown command '{cmd}', using subprocess")
             result = subprocess.run(args, check=False, env=os.environ.copy())
             return result.returncode
             
     except SystemExit as e:
-        code = e.code if e.code is not None else 0
-        if code == 0:
-            return 0
-        print(f"[Flyte] Command exited with code: {code}")
-        return code
+        return e.code if e.code is not None else 0
     except Exception as e:
         print(f"[Flyte] ERROR: {e}", file=sys.stderr)
         import traceback
@@ -478,48 +429,33 @@ def is_running_in_ipython():
 
 def main():
     """Main entrypoint for Flyte serverless tasks."""
-    print("[Flyte] " + "=" * 60)
-    print("[Flyte] Serverless Entrypoint")
-    print("[Flyte] " + "=" * 60)
-    print(f"[Flyte] Python: {sys.version.split()[0]}")
-    print(f"[Flyte] Args: {sys.argv[1:]}")
+    print("[Flyte] Serverless Entrypoint starting...")
     
     # Parse credential provider from command-line arguments
     credential_provider, remaining_args = parse_credential_provider_from_args()
     
-    # Debug: Print relevant environment variables
-    debug_print_environment()
-    
     # Configure AWS credentials from Databricks service credentials
     # This must happen BEFORE any S3 access attempts
-    credentials_configured = setup_aws_credentials_from_databricks(credential_provider)
-    if not credentials_configured:
-        print("[Flyte] ⚠ WARNING: Running without Databricks-managed AWS credentials")
-        print("[Flyte] S3 operations may fail!")
+    if not setup_aws_credentials_from_databricks(credential_provider):
+        print("[Flyte] WARNING: S3 operations may fail without credentials")
     
-    # Set up the working environment (sets DATABRICKS_SERVERLESS=true)
-    work_dir = setup_environment()
+    # Set up working environment
+    setup_environment()
     
     # Pre-initialize SparkSession and inject into builtins
-    # This ensures the Flyte plugin can find it
+    # This is critical - the SparkSession must be created HERE (before fast_execute)
+    # because Databricks' pyspark handles unix:// URLs correctly only on first import
     spark = setup_spark_session()
-    if spark:
-        print("[Flyte] SparkSession ready for Flyte tasks")
-    else:
-        print("[Flyte] ⚠ No SparkSession - Spark operations may fail")
+    if not spark:
+        print("[Flyte] WARNING: No SparkSession - Spark operations will fail")
     
-    # Execute the Flyte command IN-PROCESS (not subprocess)
-    # This preserves the SparkSession in builtins for Flyte tasks
+    # Execute the Flyte command (uses direct execution to preserve SparkSession)
     return_code = execute_flyte_command_inprocess(remaining_args)
     
-    print("[Flyte] " + "=" * 60)
     print(f"[Flyte] Task completed with return code: {return_code}")
-    print("[Flyte] " + "=" * 60)
     
-    # In IPython/Databricks notebook context, sys.exit() raises SystemExit which
-    # appears as a traceback and may be interpreted as an error by Databricks.
+    # Handle IPython context (Databricks notebook)
     if is_running_in_ipython():
-        print(f"[Flyte] Running in IPython context, not calling sys.exit()")
         if return_code != 0:
             raise RuntimeError(f"Flyte task failed with return code: {return_code}")
         return return_code
