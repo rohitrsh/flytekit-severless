@@ -295,6 +295,110 @@ def setup_environment():
     return work_dir
 
 
+def download_and_extract_distribution(additional_distribution: str, dest_dir: str):
+    """Download and extract the tarball from S3."""
+    import tarfile
+    import tempfile
+    import fsspec
+    
+    os.makedirs(dest_dir, exist_ok=True)
+    
+    with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as tmp:
+        tmp_path = tmp.name
+    
+    try:
+        fs = fsspec.filesystem('s3')
+        s3_path = additional_distribution.replace('s3://', '')
+        print(f"[Flyte] Downloading: {s3_path}")
+        fs.get(s3_path, tmp_path)
+        print(f"[Flyte] Downloaded to: {tmp_path}")
+        
+        with tarfile.open(tmp_path, 'r:gz') as tar:
+            tar.extractall(path=dest_dir)
+        print(f"[Flyte] Extracted to: {dest_dir}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def execute_flyte_task_directly(args: list):
+    """
+    Execute Flyte task DIRECTLY - download tarball, import module, run task.
+    
+    This preserves SparkSession by NOT going through fast_execute_task_cmd
+    which clears Python state when loading the task module.
+    """
+    import importlib
+    import builtins
+    
+    print("[Flyte] === DIRECT TASK EXECUTION ===")
+    
+    # Parse args
+    additional_distribution = None
+    dest_dir = "."
+    execute_args = []
+    
+    i = 0
+    while i < len(args):
+        if args[i] == "--additional-distribution" and i + 1 < len(args):
+            additional_distribution = args[i + 1]
+            i += 2
+        elif args[i] == "--dest-dir" and i + 1 < len(args):
+            dest_dir = args[i + 1]
+            i += 2
+        elif args[i] == "--":
+            execute_args = args[i + 1:]
+            break
+        else:
+            i += 1
+    
+    # Parse execute_args for task info
+    task_module = None
+    task_name = None
+    
+    for j, arg in enumerate(execute_args):
+        if arg == "task-module" and j + 1 < len(execute_args):
+            task_module = execute_args[j + 1]
+        elif arg == "task-name" and j + 1 < len(execute_args):
+            task_name = execute_args[j + 1]
+    
+    print(f"[Flyte] Distribution: {additional_distribution}")
+    print(f"[Flyte] Task: {task_module}.{task_name}")
+    
+    # Step 1: Download and extract tarball
+    if additional_distribution:
+        download_and_extract_distribution(additional_distribution, dest_dir)
+    
+    # Step 2: Add to sys.path
+    abs_dest = os.path.abspath(dest_dir)
+    if abs_dest not in sys.path:
+        sys.path.insert(0, abs_dest)
+    print(f"[Flyte] Added to path: {abs_dest}")
+    
+    # Step 3: Verify SparkSession
+    print(f"[Flyte] SparkSession available: {hasattr(builtins, 'spark')}")
+    if hasattr(builtins, 'spark'):
+        print(f"[Flyte] SparkSession: {builtins.spark}")
+    
+    # Step 4: Import task module IN OUR CONTEXT
+    print(f"[Flyte] Importing: {task_module}")
+    task_mod = importlib.import_module(task_module)
+    
+    # Step 5: Check SparkSession after import
+    print(f"[Flyte] SparkSession after import: {hasattr(builtins, 'spark')}")
+    
+    # Step 6: Execute via flytekit (it handles inputs/outputs)
+    from flytekit.bin.entrypoint import execute_task_cmd
+    
+    # Build execute args without fast-execute wrapper
+    exec_args = execute_args[1:] if execute_args and execute_args[0] == "pyflyte-execute" else execute_args
+    print(f"[Flyte] Executing task with args: {exec_args[:5]}...")
+    
+    result = execute_task_cmd.main(exec_args, standalone_mode=False)
+    print("[Flyte] === DIRECT EXECUTION COMPLETE ===")
+    return 0
+
+
 def execute_flyte_command_inprocess(args: list):
     """
     Execute the Flyte command IN-PROCESS (not as subprocess).
@@ -313,76 +417,54 @@ def execute_flyte_command_inprocess(args: list):
     print(f"[Flyte] Executing in-process: {cmd_str}")
     
     try:
-        # DIAGNOSTIC: Verify SparkSession is still stored before Flyte import
-        print("[Flyte] === PRE-FLYTE-IMPORT DIAGNOSTIC ===")
-        print(f"[Flyte] _flyte_spark_session in sys.modules: {'_flyte_spark_session' in sys.modules}")
-        if '_flyte_spark_session' in sys.modules:
-            mod = sys.modules['_flyte_spark_session']
-            print(f"[Flyte] _flyte_spark_session.spark: {getattr(mod, 'spark', 'NO ATTR')}")
-        
         import builtins as _builtins
-        print(f"[Flyte] builtins.spark exists: {hasattr(_builtins, 'spark')}")
-        if hasattr(_builtins, 'spark'):
-            print(f"[Flyte] builtins.spark: {_builtins.spark}")
-        print("[Flyte] === END PRE-FLYTE-IMPORT DIAGNOSTIC ===")
         
-        # Import Flyte's entrypoint functions (these are Click commands)
-        from flytekit.bin.entrypoint import fast_execute_task_cmd, execute_task_cmd
-        
-        # DIAGNOSTIC: Verify SparkSession is still stored AFTER Flyte import
-        print("[Flyte] === POST-FLYTE-IMPORT DIAGNOSTIC ===")
-        print(f"[Flyte] _flyte_spark_session in sys.modules: {'_flyte_spark_session' in sys.modules}")
-        if '_flyte_spark_session' in sys.modules:
-            mod = sys.modules['_flyte_spark_session']
-            print(f"[Flyte] _flyte_spark_session.spark: {getattr(mod, 'spark', 'NO ATTR')}")
-        print(f"[Flyte] builtins.spark exists: {hasattr(_builtins, 'spark')}")
+        # DIAGNOSTIC
+        print("[Flyte] === PRE-EXECUTION DIAGNOSTIC ===")
+        print(f"[Flyte] builtins.spark: {hasattr(_builtins, 'spark')}")
         if hasattr(_builtins, 'spark'):
-            print(f"[Flyte] builtins.spark: {_builtins.spark}")
-        print("[Flyte] === END POST-FLYTE-IMPORT DIAGNOSTIC ===")
+            print(f"[Flyte]   value: {_builtins.spark}")
+        print("[Flyte] === END DIAGNOSTIC ===")
         
         if cmd == "pyflyte-fast-execute":
-            # fast_execute_task_cmd is a Click command - invoke with standalone_mode=False
-            # to prevent sys.exit() and get proper return values
-            # Args format: --additional-distribution <url> --dest-dir <dir> -- pyflyte-execute ...
-            click_args = args[1:]  # Remove the command name, keep the rest
-            print(f"[Flyte] Invoking fast_execute_task_cmd with args: {click_args}")
+            click_args = args[1:]
             
-            result = fast_execute_task_cmd.main(click_args, standalone_mode=False)
-            return 0
+            # Use DIRECT execution to preserve SparkSession
+            try:
+                return execute_flyte_task_directly(click_args)
+            except Exception as e:
+                print(f"[Flyte] Direct execution failed: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Fallback to standard execution
+                print("[Flyte] Falling back to fast_execute_task_cmd...")
+                from flytekit.bin.entrypoint import fast_execute_task_cmd
+                result = fast_execute_task_cmd.main(click_args, standalone_mode=False)
+                return 0
             
         elif cmd == "pyflyte-execute":
-            # execute_task_cmd is also a Click command
+            from flytekit.bin.entrypoint import execute_task_cmd
             click_args = args[1:]
-            print(f"[Flyte] Invoking execute_task_cmd with args: {click_args}")
-            
             result = execute_task_cmd.main(click_args, standalone_mode=False)
             return 0
             
         else:
-            # Fallback to subprocess for unknown commands
             print(f"[Flyte] Unknown command '{cmd}', falling back to subprocess")
             result = subprocess.run(args, check=False, env=os.environ.copy())
             return result.returncode
             
     except SystemExit as e:
-        # Click commands may still call sys.exit() even with standalone_mode=False
         code = e.code if e.code is not None else 0
         if code == 0:
             return 0
         print(f"[Flyte] Command exited with code: {code}")
         return code
     except Exception as e:
-        print(f"[Flyte] ERROR: In-process execution failed: {e}", file=sys.stderr)
+        print(f"[Flyte] ERROR: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
-        # Fallback to subprocess
-        print("[Flyte] Falling back to subprocess execution...")
-        try:
-            result = subprocess.run(args, check=False, env=os.environ.copy())
-            return result.returncode
-        except Exception as e2:
-            print(f"[Flyte] ERROR: Subprocess also failed: {e2}", file=sys.stderr)
-            return 1
+        return 1
 
 
 def is_running_in_ipython():
