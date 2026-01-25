@@ -186,23 +186,30 @@ def setup_aws_credentials_from_databricks(credential_provider: str = None):
 
 def setup_spark_session():
     """
-    Pre-initialize SparkSession and inject it into builtins.
+    Pre-initialize SparkSession and store it for Flyte tasks.
     
     IMPORTANT: In Databricks serverless python_file tasks, the 'spark' variable
     is NOT automatically injected like it is in notebooks.
     
-    Key insight from logs: Databricks serverless uses Py4J mode, not Spark Connect.
-    The `databricks-connect` pip package's DatabricksSession is for connecting
-    FROM OUTSIDE Databricks, not for code running INSIDE.
+    We store the SparkSession in TWO places to survive module reloads:
+    1. A custom module '_flyte_spark_session' in sys.modules (most reliable)
+    2. builtins.spark (backup)
     
-    Solution: Use standard SparkSession.builder.getOrCreate() from Databricks'
-    native PySpark, which knows how to use the existing Py4J connection.
+    The custom module approach survives even if other code deletes pyspark
+    from sys.modules or manipulates builtins.
     """
     import builtins
     import sys
+    import types
     
-    # Check if spark is already in builtins
-    if hasattr(builtins, 'spark'):
+    # Check if we already have a spark session stored
+    if '_flyte_spark_session' in sys.modules:
+        spark_module = sys.modules['_flyte_spark_session']
+        if hasattr(spark_module, 'spark') and spark_module.spark is not None:
+            print(f"[Flyte] SparkSession already stored: {spark_module.spark}")
+            return spark_module.spark
+    
+    if hasattr(builtins, 'spark') and builtins.spark is not None:
         print(f"[Flyte] SparkSession already in builtins: {builtins.spark}")
         return builtins.spark
     
@@ -226,47 +233,39 @@ def setup_spark_session():
             print(f"[Flyte] Prioritized Databricks Python path: {db_path}")
             break
     
+    spark = None
+    
     # Method 1: Use SparkSession.builder.getOrCreate() (standard approach)
-    # In Databricks, this returns the existing session configured by the runtime
-    # DO NOT use .remote() - that's for Spark Connect which uses different URLs
     try:
         from pyspark.sql import SparkSession
         print("[Flyte] Creating SparkSession via SparkSession.builder.getOrCreate()...")
         spark = SparkSession.builder.getOrCreate()
         print(f"[Flyte] ✓ SparkSession created: {spark}")
-        
-        # Inject into builtins so plugin can find it
-        builtins.spark = spark
-        print("[Flyte] ✓ SparkSession injected into builtins")
-        return spark
-        
     except Exception as e:
         print(f"[Flyte] SparkSession.builder.getOrCreate() failed: {e}")
-        import traceback
-        traceback.print_exc()
     
     # Method 2: Try to get an active session
-    try:
-        from pyspark.sql import SparkSession
-        active = SparkSession.getActiveSession()
-        if active:
-            print(f"[Flyte] Got active SparkSession: {active}")
-            builtins.spark = active
-            return active
-    except Exception as e:
-        print(f"[Flyte] Could not get active session: {e}")
+    if spark is None:
+        try:
+            from pyspark.sql import SparkSession
+            spark = SparkSession.getActiveSession()
+            if spark:
+                print(f"[Flyte] Got active SparkSession: {spark}")
+        except Exception as e:
+            print(f"[Flyte] Could not get active session: {e}")
     
-    # Method 3: Try DatabricksSession (only works if not pip-installed version)
-    # This is a fallback - the pip-installed databricks-connect doesn't work inside Databricks
-    try:
-        from databricks.connect import DatabricksSession
-        print("[Flyte] Trying DatabricksSession.builder.getOrCreate()...")
-        spark = DatabricksSession.builder.getOrCreate()
-        print(f"[Flyte] ✓ SparkSession created via DatabricksSession: {spark}")
+    if spark is not None:
+        # Store in a custom module (survives module reloads)
+        spark_module = types.ModuleType('_flyte_spark_session')
+        spark_module.spark = spark
+        sys.modules['_flyte_spark_session'] = spark_module
+        print("[Flyte] ✓ SparkSession stored in _flyte_spark_session module")
+        
+        # Also store in builtins as backup
         builtins.spark = spark
+        print("[Flyte] ✓ SparkSession injected into builtins")
+        
         return spark
-    except Exception as e:
-        print(f"[Flyte] DatabricksSession failed (expected if pip-installed): {e}")
     
     print("[Flyte] WARNING: Could not initialize SparkSession")
     return None
