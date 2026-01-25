@@ -56,12 +56,8 @@ def parse_credential_provider_from_args():
     for arg in sys.argv[1:]:
         if arg.startswith("--flyte-credential-provider="):
             credential_provider = arg.split("=", 1)[1]
-            print(f"[Flyte] Credential provider from args: {credential_provider}")
         else:
             remaining_args.append(arg)
-    
-    if remaining_args:
-        print(f"[Flyte] Command: {remaining_args[0]} ...")
     
     return credential_provider, remaining_args
 
@@ -403,10 +399,13 @@ def is_running_in_ipython():
 
 def main():
     """Main entrypoint for Flyte serverless tasks."""
-    print("[Flyte] Serverless Entrypoint starting...")
+    print("[Flyte] Serverless Entrypoint")
+    print(f"[Flyte] Python: {sys.version.split()[0]}")
+    print(f"[Flyte] Raw args: {sys.argv[1:]}")
     
     # Parse credential provider from command-line arguments
     credential_provider, remaining_args = parse_credential_provider_from_args()
+    print(f"[Flyte] Executing: {' '.join(remaining_args[:3])}..." if len(remaining_args) > 3 else f"[Flyte] Executing: {' '.join(remaining_args)}")
     
     # Configure AWS credentials from Databricks service credentials
     # This must happen BEFORE any S3 access attempts
