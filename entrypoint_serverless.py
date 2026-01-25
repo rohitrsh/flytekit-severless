@@ -189,12 +189,14 @@ def setup_spark_session():
     Pre-initialize SparkSession and inject it into builtins.
     
     IMPORTANT: In Databricks serverless python_file tasks, the 'spark' variable
-    is NOT automatically injected like it is in notebooks. We must explicitly
-    create a SparkSession using DatabricksSession.
+    is NOT automatically injected like it is in notebooks.
     
-    Key insight: databricks.connect is PRE-INSTALLED in Databricks serverless
-    runtime under /databricks/python/... We need to prioritize that path to
-    use it instead of any pip-installed version.
+    Key insight from logs: Databricks serverless uses Py4J mode, not Spark Connect.
+    The `databricks-connect` pip package's DatabricksSession is for connecting
+    FROM OUTSIDE Databricks, not for code running INSIDE.
+    
+    Solution: Use standard SparkSession.builder.getOrCreate() from Databricks'
+    native PySpark, which knows how to use the existing Py4J connection.
     """
     import builtins
     import sys
@@ -209,7 +211,7 @@ def setup_spark_session():
         print(f"[Flyte] SPARK_REMOTE: {spark_remote}")
     
     # CRITICAL: Prioritize Databricks' native Python path FIRST
-    # This ensures we use the pre-installed databricks.connect, not pip-installed
+    # This ensures we use Databricks' PySpark, not pip-installed version
     db_paths = [
         "/databricks/python/lib/python3.12/site-packages",
         "/databricks/python/lib/python3.11/site-packages", 
@@ -224,50 +226,47 @@ def setup_spark_session():
             print(f"[Flyte] Prioritized Databricks Python path: {db_path}")
             break
     
-    # Method 1: Use DatabricksSession (the correct API for python_file tasks)
-    # This is the recommended way to get SparkSession in Databricks serverless
+    # Method 1: Use SparkSession.builder.getOrCreate() (standard approach)
+    # In Databricks, this returns the existing session configured by the runtime
+    # DO NOT use .remote() - that's for Spark Connect which uses different URLs
     try:
-        from databricks.connect import DatabricksSession
-        print("[Flyte] Creating SparkSession via DatabricksSession.builder.getOrCreate()...")
-        spark = DatabricksSession.builder.getOrCreate()
-        print(f"[Flyte] ✓ SparkSession created via DatabricksSession: {spark}")
+        from pyspark.sql import SparkSession
+        print("[Flyte] Creating SparkSession via SparkSession.builder.getOrCreate()...")
+        spark = SparkSession.builder.getOrCreate()
+        print(f"[Flyte] ✓ SparkSession created: {spark}")
         
         # Inject into builtins so plugin can find it
         builtins.spark = spark
         print("[Flyte] ✓ SparkSession injected into builtins")
         return spark
         
-    except ImportError as e:
-        print(f"[Flyte] databricks.connect not available in sys.path: {e}")
-        print(f"[Flyte] Current sys.path: {sys.path[:5]}...")
     except Exception as e:
-        print(f"[Flyte] DatabricksSession.builder.getOrCreate() failed: {e}")
+        print(f"[Flyte] SparkSession.builder.getOrCreate() failed: {e}")
         import traceback
         traceback.print_exc()
     
-    # Method 2: Try using SparkSession directly (fallback)
+    # Method 2: Try to get an active session
     try:
         from pyspark.sql import SparkSession
-        
-        # First try to get an active session
         active = SparkSession.getActiveSession()
         if active:
             print(f"[Flyte] Got active SparkSession: {active}")
             builtins.spark = active
             return active
-        
-        # Try creating via SPARK_REMOTE if available
-        if spark_remote:
-            print("[Flyte] Creating SparkSession via SPARK_REMOTE...")
-            spark = SparkSession.builder.remote(spark_remote).getOrCreate()
-            print(f"[Flyte] ✓ SparkSession created via remote: {spark}")
-            builtins.spark = spark
-            return spark
-        
     except Exception as e:
-        print(f"[Flyte] WARNING: Could not initialize SparkSession via PySpark: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[Flyte] Could not get active session: {e}")
+    
+    # Method 3: Try DatabricksSession (only works if not pip-installed version)
+    # This is a fallback - the pip-installed databricks-connect doesn't work inside Databricks
+    try:
+        from databricks.connect import DatabricksSession
+        print("[Flyte] Trying DatabricksSession.builder.getOrCreate()...")
+        spark = DatabricksSession.builder.getOrCreate()
+        print(f"[Flyte] ✓ SparkSession created via DatabricksSession: {spark}")
+        builtins.spark = spark
+        return spark
+    except Exception as e:
+        print(f"[Flyte] DatabricksSession failed (expected if pip-installed): {e}")
     
     print("[Flyte] WARNING: Could not initialize SparkSession")
     return None
