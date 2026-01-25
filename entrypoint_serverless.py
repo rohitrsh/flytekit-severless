@@ -66,32 +66,6 @@ def parse_credential_provider_from_args():
     return credential_provider, remaining_args
 
 
-def debug_print_environment():
-    """Print relevant environment variables for debugging."""
-    print("[Flyte] === Relevant Environment Variables ===")
-    relevant_vars = []
-    other_count = 0
-    
-    for key in sorted(os.environ.keys()):
-        value = os.environ[key]
-        # Mask sensitive values
-        if any(secret_word in key.upper() for secret_word in ['SECRET', 'TOKEN', 'PASSWORD', 'KEY', 'CREDENTIAL']):
-            if len(value) > 8:
-                value = value[:4] + "****" + value[-4:]
-        
-        # Only show relevant vars
-        if any(x in key.upper() for x in ['AWS', 'FLYTE', 'DATABRICKS', 'S3', 'SPARK']):
-            relevant_vars.append(f"  {key}={value}")
-        else:
-            other_count += 1
-    
-    for v in relevant_vars:
-        print(f"[Flyte] {v}")
-    
-    print(f"[Flyte] + {other_count} other variables")
-    print("[Flyte] === END ===")
-
-
 def setup_aws_credentials_from_databricks(credential_provider: str = None):
     """
     Configure AWS credentials from Databricks service credentials.
@@ -447,7 +421,8 @@ def main():
     # because Databricks' pyspark handles unix:// URLs correctly only on first import
     spark = setup_spark_session()
     if not spark:
-        print("[Flyte] WARNING: No SparkSession - Spark operations will fail")
+        print("[Flyte] ERROR: Failed to create SparkSession - cannot proceed")
+        sys.exit(1)
     
     # Execute the Flyte command (uses direct execution to preserve SparkSession)
     return_code = execute_flyte_command_inprocess(remaining_args)
