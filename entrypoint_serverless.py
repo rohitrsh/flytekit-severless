@@ -188,10 +188,16 @@ def setup_spark_session():
     """
     Pre-initialize SparkSession and inject it into builtins.
     
-    This ensures the Flyte plugin can find the SparkSession via builtins.spark,
-    which is the standard Databricks way of exposing the pre-configured session.
+    IMPORTANT: In Databricks serverless python_file tasks, the 'spark' variable
+    is NOT automatically injected like it is in notebooks. We must explicitly
+    create a SparkSession using DatabricksSession.
+    
+    Key insight: databricks.connect is PRE-INSTALLED in Databricks serverless
+    runtime under /databricks/python/... We need to prioritize that path to
+    use it instead of any pip-installed version.
     """
     import builtins
+    import sys
     
     # Check if spark is already in builtins
     if hasattr(builtins, 'spark'):
@@ -199,30 +205,48 @@ def setup_spark_session():
         return builtins.spark
     
     spark_remote = os.environ.get("SPARK_REMOTE")
-    if not spark_remote:
-        print("[Flyte] SPARK_REMOTE not set - cannot initialize SparkSession")
-        return None
+    if spark_remote:
+        print(f"[Flyte] SPARK_REMOTE: {spark_remote}")
     
-    print(f"[Flyte] SPARK_REMOTE: {spark_remote}")
+    # CRITICAL: Prioritize Databricks' native Python path FIRST
+    # This ensures we use the pre-installed databricks.connect, not pip-installed
+    db_paths = [
+        "/databricks/python/lib/python3.12/site-packages",
+        "/databricks/python/lib/python3.11/site-packages", 
+        "/databricks/python/lib/python3.10/site-packages",
+    ]
     
+    for db_path in db_paths:
+        if os.path.exists(db_path):
+            if db_path in sys.path:
+                sys.path.remove(db_path)
+            sys.path.insert(0, db_path)
+            print(f"[Flyte] Prioritized Databricks Python path: {db_path}")
+            break
+    
+    # Method 1: Use DatabricksSession (the correct API for python_file tasks)
+    # This is the recommended way to get SparkSession in Databricks serverless
     try:
-        # Use Databricks' PySpark which understands the Unix socket format
-        import sys
-        db_paths = [
-            "/databricks/python/lib/python3.12/site-packages",
-            "/databricks/python/lib/python3.11/site-packages", 
-            "/databricks/python/lib/python3.10/site-packages",
-        ]
+        from databricks.connect import DatabricksSession
+        print("[Flyte] Creating SparkSession via DatabricksSession.builder.getOrCreate()...")
+        spark = DatabricksSession.builder.getOrCreate()
+        print(f"[Flyte] ✓ SparkSession created via DatabricksSession: {spark}")
         
-        # Insert Databricks paths at the beginning so they take precedence
-        for db_path in db_paths:
-            if os.path.exists(db_path):
-                if db_path in sys.path:
-                    sys.path.remove(db_path)
-                sys.path.insert(0, db_path)
-                print(f"[Flyte] Prioritized Databricks PySpark: {db_path}")
-                break
+        # Inject into builtins so plugin can find it
+        builtins.spark = spark
+        print("[Flyte] ✓ SparkSession injected into builtins")
+        return spark
         
+    except ImportError as e:
+        print(f"[Flyte] databricks.connect not available in sys.path: {e}")
+        print(f"[Flyte] Current sys.path: {sys.path[:5]}...")
+    except Exception as e:
+        print(f"[Flyte] DatabricksSession.builder.getOrCreate() failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Method 2: Try using SparkSession directly (fallback)
+    try:
         from pyspark.sql import SparkSession
         
         # First try to get an active session
@@ -232,22 +256,21 @@ def setup_spark_session():
             builtins.spark = active
             return active
         
-        # Create session using SPARK_REMOTE
-        print("[Flyte] Creating SparkSession via SPARK_REMOTE...")
-        spark = SparkSession.builder.remote(spark_remote).getOrCreate()
-        print(f"[Flyte] ✓ SparkSession created: {spark}")
-        
-        # Inject into builtins so plugin can find it
-        builtins.spark = spark
-        print("[Flyte] ✓ SparkSession injected into builtins")
-        
-        return spark
+        # Try creating via SPARK_REMOTE if available
+        if spark_remote:
+            print("[Flyte] Creating SparkSession via SPARK_REMOTE...")
+            spark = SparkSession.builder.remote(spark_remote).getOrCreate()
+            print(f"[Flyte] ✓ SparkSession created via remote: {spark}")
+            builtins.spark = spark
+            return spark
         
     except Exception as e:
-        print(f"[Flyte] WARNING: Could not initialize SparkSession: {e}")
+        print(f"[Flyte] WARNING: Could not initialize SparkSession via PySpark: {e}")
         import traceback
         traceback.print_exc()
-        return None
+    
+    print("[Flyte] WARNING: Could not initialize SparkSession")
+    return None
 
 
 def setup_environment():
